@@ -21,7 +21,14 @@ struct AudiobookShelfAudiobookDetailsData: IntegrationDetailsDataProtocol {
   let publishedYear: String?
   let publisher: String?
   let series: [Series]?
-  
+  /// The item's audio files in playback order, for downloading them one by one
+  let audioFiles: [AudioFileReference]
+
+  struct AudioFileReference: Hashable {
+    let ino: String
+    let filename: String
+  }
+
   struct Series: Identifiable, Hashable {
     let id: String
     let name: String
@@ -154,5 +161,8 @@ extension AudiobookShelfAudiobookDetailsData {
     self.series = metadata.series?.map { apiSeries in
       Series(id: apiSeries.id, name: apiSeries.name, sequence: apiSeries.sequence)
     }
+    self.audioFiles = (apiResponse.media.audioFiles ?? [])
+      .sorted { $0.index < $1.index }
+      .map { AudioFileReference(ino: $0.ino, filename: $0.metadata.filename) }
   }
 }

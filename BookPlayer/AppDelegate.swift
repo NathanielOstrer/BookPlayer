@@ -80,8 +80,26 @@ class AppDelegate: UIResponder, UIApplicationDelegate, BPLogger {
     self.setupSentry()
     // Setup core services
     AppServices.shared.setupCoreServices()
+    // Reconnect to downloads that continued while the app wasn't running, so the ones
+    // that finished get moved into the library
+    _ = BackgroundDownloadSession.shared
 
     return true
+  }
+
+  func application(
+    _ application: UIApplication,
+    handleEventsForBackgroundURLSession identifier: String,
+    completionHandler: @escaping () -> Void
+  ) {
+    guard identifier == BackgroundDownloadSession.identifier else {
+      /// Other background sessions don't wait for this handler, so release it right away
+      completionHandler()
+      return
+    }
+
+    /// Accessing `shared` recreates the session, which makes the system deliver its events
+    BackgroundDownloadSession.shared.backgroundEventsCompletionHandler = completionHandler
   }
 
   func application(

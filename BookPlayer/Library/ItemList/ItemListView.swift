@@ -247,27 +247,40 @@ struct ItemListView: View {
       }
     }
     .onReceive(
-      model.singleFileDownloadService.eventsPublisher
-        .throttle(for: .seconds(1), scheduler: DispatchQueue.main, latest: true)
+      /// Only progress is throttled: a throttle keeps the latest event of each second, and
+      /// would drop an error followed closely by another file finishing
+      Publishers.Merge(
+        model.singleFileDownloadService.eventsPublisher
+          .filter(\.isProgressUpdate)
+          .throttle(for: .seconds(1), scheduler: DispatchQueue.main, latest: true),
+        model.singleFileDownloadService.eventsPublisher
+          .filter { !$0.isProgressUpdate }
+          .receive(on: DispatchQueue.main)
+      )
     ) { event in
       switch event {
       case .starting:
-        let totalFiles = model.singleFileDownloadService.downloadQueue.count + 1
+        let totalFiles = max(model.singleFileDownloadService.activeDownloadCount, 1)
         let title = String.localizedStringWithFormat("downloading_file_title".localized, totalFiles)
         let subtitle = "\("progress_title".localized) 0%"
 
         importOperationState.isOperationActive = true
         importOperationState.processingTitle = "\(title)\n\(subtitle)"
       case .progress(_, let progress):
+        /// A throttled update can arrive after the last file finished
+        guard model.singleFileDownloadService.isDownloading else { return }
+
         let percentage = String(format: "%.2f", progress * 100)
-        let totalFiles = model.singleFileDownloadService.downloadQueue.count + 1
+        let totalFiles = max(model.singleFileDownloadService.activeDownloadCount, 1)
         let title = String.localizedStringWithFormat("downloading_file_title".localized, totalFiles)
         let subtitle = "\("progress_title".localized) \(percentage)%"
 
         importOperationState.isOperationActive = true
         importOperationState.processingTitle = "\(title)\n\(subtitle)"
       case .bytesWritten(_, let bytesWritten):
-        let totalFiles = model.singleFileDownloadService.downloadQueue.count + 1
+        guard model.singleFileDownloadService.isDownloading else { return }
+
+        let totalFiles = max(model.singleFileDownloadService.activeDownloadCount, 1)
         let title = String.localizedStringWithFormat("downloading_file_title".localized, totalFiles)
         let sizeDownloaded = ByteCountFormatter.string(
           fromByteCount: bytesWritten,
@@ -278,6 +291,8 @@ struct ItemListView: View {
         importOperationState.isOperationActive = true
         importOperationState.processingTitle = "\(title)\n\(subtitle)"
       case .finished:
+        guard !model.singleFileDownloadService.isDownloading else { return }
+
         importOperationState.isOperationActive = false
         importOperationState.processingTitle = ""
       case .error(let errorKind, let task, let underlyingError):
@@ -287,7 +302,7 @@ struct ItemListView: View {
           underlyingError: underlyingError
         )
 
-        if model.singleFileDownloadService.downloadQueue.count == 0 {
+        if !model.singleFileDownloadService.isDownloading {
           importOperationState.isOperationActive = false
           importOperationState.processingTitle = ""
         }

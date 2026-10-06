@@ -229,19 +229,31 @@ final class AudiobookShelfLibraryViewModel: IntegrationLibraryViewModelProtocol,
       self.items.first(where: { $0.id == id && $0.isDownloadable })
     }
 
-    var requests = [URLRequest]()
-    for item in items {
-      do {
-        let request = try connectionService.createItemDownloadRequest(item)
-        requests.append(request)
-      } catch {
-        self.error = error
-      }
-    }
+    guard !items.isEmpty else { return }
 
-    guard !requests.isEmpty else { return }
-    singleFileDownloadService.handleDownload(requests)
-    navigation.dismiss?()
+    Task { @MainActor [weak self] in
+      guard let self else { return }
+
+      var plans = [AudiobookShelfDownloadPlan]()
+      for item in items {
+        do {
+          plans.append(try await self.connectionService.fetchItemDownloadPlan(item))
+        } catch {
+          self.error = error
+        }
+      }
+
+      guard !plans.isEmpty else { return }
+
+      for plan in plans {
+        self.singleFileDownloadService.handleDownload(
+          plan.requests,
+          folderName: plan.folderName,
+          allOrNothing: true
+        )
+      }
+      self.navigation.dismiss?()
+    }
   }
 
   private func handleSortChanged() {

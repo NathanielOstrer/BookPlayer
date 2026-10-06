@@ -35,6 +35,13 @@ public class BPTaskDownloadDelegate: NSObject, URLSessionDownloadDelegate {
   /// Callback triggered when the total size of the download is unknown,
   /// and we can't compute a progress percentage
   public var downloadBytesWrittenUpdated: ((URLSessionDownloadTask, Int64) -> Void)?
+  /// Callback triggered on every progress update with the raw totals: bytes written so far
+  /// and bytes expected (`NSURLSessionTransferSizeUnknown` when the size is unknown). For a
+  /// resumed download both include the bytes written before the resume.
+  public var downloadBytesUpdated: ((URLSessionDownloadTask, Int64, Int64) -> Void)?
+  /// Callback triggered when a background session has delivered every event it queued
+  /// while the app was suspended or not running
+  public var didFinishEventsForBackgroundSession: (() -> Void)?
   /// Delegate callback when download finishes
   public func urlSession(
     _ session: URLSession,
@@ -44,8 +51,12 @@ public class BPTaskDownloadDelegate: NSObject, URLSessionDownloadDelegate {
     didFinishDownloadingTask?(
       downloadTask,
       location,
-      parseErrorFromTask(downloadTask) ?? verifyDownloadIsComplete(downloadTask)
+      parseErrorFromTask(downloadTask) ?? verifyDownloadIsComplete(downloadTask, fileURL: location)
     )
+  }
+
+  public func urlSessionDidFinishEvents(forBackgroundURLSession session: URLSession) {
+    didFinishEventsForBackgroundSession?()
   }
 
   /// Note: this gets called even if there's no error
@@ -66,6 +77,8 @@ public class BPTaskDownloadDelegate: NSObject, URLSessionDownloadDelegate {
     totalBytesWritten: Int64,
     totalBytesExpectedToWrite: Int64
   ) {
+    downloadBytesUpdated?(downloadTask, totalBytesWritten, totalBytesExpectedToWrite)
+
     let calculatedProgress = Float(totalBytesWritten) / Float(totalBytesExpectedToWrite)
 
     if totalBytesExpectedToWrite == -1 {
@@ -75,22 +88,47 @@ public class BPTaskDownloadDelegate: NSObject, URLSessionDownloadDelegate {
     }
   }
 
-  /// Verifies the bytes written to disk match the `Content-Length` the server
-  /// reported. Background downloads can finish "successfully" with a truncated
-  /// body (interrupted transfer, early connection close) and `URLSession` won't
-  /// flag it, so we treat a short file as an error instead of accepting it.
-  private func verifyDownloadIsComplete(_ task: URLSessionTask) -> Error? {
-    let expectedBytes = task.countOfBytesExpectedToReceive
-    /// `NSURLSessionTransferSizeUnknown` (-1) means the server didn't send a
-    /// Content-Length; we can't validate the size, so don't block the download.
-    guard expectedBytes != NSURLSessionTransferSizeUnknown else { return nil }
+  /// Verifies the bytes written to disk match the size the server reported. Background
+  /// downloads can finish "successfully" with a truncated body (interrupted transfer, early
+  /// connection close) and `URLSession` won't flag it, so we treat a short file as an error
+  /// instead of accepting it.
+  ///
+  /// The file on disk is checked rather than the task's byte counters, because a task
+  /// resumed from resume data only counts the bytes of its own `206` response.
+  private func verifyDownloadIsComplete(_ task: URLSessionTask, fileURL: URL) -> Error? {
+    /// No usable size from the server (no `Content-Length`, e.g. a streamed zip):
+    /// we can't validate it, so don't block the download.
+    guard let expectedBytes = Self.expectedFileSize(for: task.response) else { return nil }
 
-    let receivedBytes = task.countOfBytesReceived
+    let receivedBytes =
+      (try? fileURL.resourceValues(forKeys: [.fileSizeKey]).fileSize).map(Int64.init)
+      ?? task.countOfBytesReceived
     guard receivedBytes >= expectedBytes else {
       return DownloadError.incompleteDownload(received: receivedBytes, expected: expectedBytes)
     }
 
     return nil
+  }
+
+  /// The full size of the file a response describes. For a `206 Partial Content` (a resumed
+  /// download) that's the total after the slash in `Content-Range: bytes 100-199/1000`,
+  /// because `Content-Length` only covers the remaining part.
+  static func expectedFileSize(for response: URLResponse?) -> Int64? {
+    guard let response else { return nil }
+
+    if let http = response as? HTTPURLResponse,
+       http.statusCode == 206 {
+      guard
+        let contentRange = http.value(forHTTPHeaderField: "Content-Range"),
+        let total = contentRange.split(separator: "/").last.flatMap({ Int64($0) })
+      else {
+        return nil
+      }
+      return total
+    }
+
+    let expected = response.expectedContentLength
+    return expected == NSURLSessionTransferSizeUnknown ? nil : expected
   }
 
   private func parseErrorFromTask(_ task: URLSessionTask) -> Error? {

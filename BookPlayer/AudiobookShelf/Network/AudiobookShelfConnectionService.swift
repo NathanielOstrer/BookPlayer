@@ -616,36 +616,88 @@ class AudiobookShelfConnectionService: BPLogger {
     return AudiobookShelfAudiobookDetailsData(apiResponse: detailsResponse)
   }
 
-  /// Builds the download URL. The token is deliberately **not** appended as a query
-  /// parameter: ABS documents `Authorization: Bearer` as the primary scheme (`?token=`
-  /// is only an optional convenience for GETs), and a token-bearing URL leaks into
-  /// proxy/CDN access logs and into the download task's persisted `taskDescription`.
-  ///
-  /// Kept private because the returned URL is *not* self-authenticating — handing it
-  /// straight to `URLSession`/`AVURLAsset` would 401. Go through
-  /// `createItemDownloadRequest(_:)`, which attaches the bearer.
-  private func createItemDownloadUrl(
+  /// Plans the download of `item` from its already-fetched details. See
+  /// ``AudiobookShelfDownloadPlan`` for why files are downloaded one by one.
+  public func createItemDownloadPlan(
     _ item: AudiobookShelfLibraryItem,
-    connection: AudiobookShelfConnectionData
-  ) -> URL {
-    return connection.url
-      .appendingPathComponent("api")
-      .appendingPathComponent("items")
-      .appendingPathComponent(item.id)
-      .appendingPathComponent("download")
-  }
-
-  /// Returns a URLRequest for downloading a library item, carrying the bearer
-  /// token via the standard `Authorization: Bearer` header plus the user-defined
-  /// custom HTTP headers (needed for servers behind Cloudflare Access etc.).
-  public func createItemDownloadRequest(_ item: AudiobookShelfLibraryItem) throws -> URLRequest {
+    details: AudiobookShelfAudiobookDetailsData?
+  ) throws -> AudiobookShelfDownloadPlan {
     guard let connection else {
       throw URLError(.userAuthenticationRequired)
     }
-    let url = createItemDownloadUrl(item, connection: connection)
-    var request = URLRequest(url: url)
-    applyAuthenticatedHeaders(to: &request, connection: connection)
-    return request
+
+    return Self.downloadPlan(
+      itemID: item.id,
+      title: item.title,
+      audioFiles: details?.audioFiles ?? [],
+      connection: connection
+    )
+  }
+
+  /// Fetches the item's file list, then plans its download. If the list can't be fetched,
+  /// the plan falls back to the whole-item zip, which works as long as the app stays open.
+  public func fetchItemDownloadPlan(_ item: AudiobookShelfLibraryItem) async throws -> AudiobookShelfDownloadPlan {
+    let details: AudiobookShelfAudiobookDetailsData?
+    do {
+      details = try await fetchItemDetails(for: item.id)
+    } catch let error as IntegrationError where error.isSessionExpired {
+      throw error
+    } catch {
+      Self.logger.warning("Couldn't fetch the files of \(item.id), downloading it as a zip: \(error.localizedDescription)")
+      details = nil
+    }
+
+    return try createItemDownloadPlan(item, details: details)
+  }
+
+  nonisolated static func downloadPlan(
+    itemID: String,
+    title: String,
+    audioFiles: [AudiobookShelfAudiobookDetailsData.AudioFileReference],
+    connection: AudiobookShelfConnectionData
+  ) -> AudiobookShelfDownloadPlan {
+    let itemURL = connection.url
+      .appendingPathComponent("api")
+      .appendingPathComponent("items")
+      .appendingPathComponent(itemID)
+
+    /// The token is deliberately **not** appended as a query parameter: ABS documents
+    /// `Authorization: Bearer` as the primary scheme (`?token=` is only an optional convenience
+    /// for GETs), and a token-bearing URL leaks into proxy/CDN access logs and into the download
+    /// task's persisted `taskDescription`.
+    func authenticatedRequest(_ url: URL) -> URLRequest {
+      /// Same order as `applyAuthenticatedHeaders`: custom headers first, so none of them
+      /// can replace the bearer token
+      var request = URLRequest(url: url)
+      for (key, value) in connection.customHeaders {
+        request.setValue(value, forHTTPHeaderField: key)
+      }
+      request.setValue("Bearer \(connection.apiToken)", forHTTPHeaderField: "Authorization")
+      return request
+    }
+
+    guard !audioFiles.isEmpty else {
+      /// Podcasts, or a file list we couldn't read
+      return AudiobookShelfDownloadPlan(
+        requests: [authenticatedRequest(itemURL.appendingPathComponent("download"))],
+        folderName: nil
+      )
+    }
+
+    let requests = audioFiles.map { file in
+      authenticatedRequest(
+        itemURL
+          .appendingPathComponent("file")
+          .appendingPathComponent(file.ino)
+          .appendingPathComponent("download")
+      )
+    }
+
+    return AudiobookShelfDownloadPlan(
+      requests: requests,
+      /// One file imports as a book on its own; several need a folder to stay one book
+      folderName: audioFiles.count > 1 ? title : nil
+    )
   }
 
   /// Fire-and-forget POST to ABS's `/logout` to revoke a connection's apiToken server-side.
@@ -728,4 +780,18 @@ class AudiobookShelfConnectionService: BPLogger {
 
     return URL(string: urlString)
   }
+}
+
+/// The requests that download one AudiobookShelf item.
+///
+/// Files go one by one through `/api/items/:id/file/:ino/download` instead of the whole-item
+/// `/api/items/:id/download`. For an item stored as a folder (most books), the whole-item route
+/// streams a zip built on the fly: no `Content-Length`, no `Range` support. A dropped connection
+/// can't resume, and a large book fails once the app leaves the foreground. The per-file route
+/// serves the file itself, with `Accept-Ranges`, `ETag` and `Last-Modified`, so the background
+/// session can resume it.
+struct AudiobookShelfDownloadPlan {
+  let requests: [URLRequest]
+  /// Set when the item has several audio files, so they import as one book
+  let folderName: String?
 }

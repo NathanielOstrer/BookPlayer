@@ -62,7 +62,12 @@ class AudiobookShelfAudiobookDetailsViewModel: IntegrationDetailsViewModelProtoc
 
   @MainActor
   func beginDownloadAudiobook(_ item: AudiobookShelfLibraryItem) throws {
-    let request = try connectionService.createItemDownloadRequest(item)
-    singleFileDownloadService.handleDownload(request)
+    /// Before the details load, there's no file list, and the plan falls back to the zip
+    let plan = try connectionService.createItemDownloadPlan(item, details: details)
+    singleFileDownloadService.handleDownload(
+      plan.requests,
+      folderName: plan.folderName,
+      allOrNothing: true
+    )
   }
 }

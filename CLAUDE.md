@@ -295,6 +295,25 @@ lines). It is the highest-risk file in the app.
   `schedule*` method short-circuits on `guard isActive`.
 - **Sync = the `pro` entitlement only** (see below). Job types (`SyncJobType`): `upload, update, move,
   renameFolder, delete, shallowDelete, setBookmark, deleteBookmark, uploadArtwork, matchUuid`.
+- **Single-file downloads** (URL imports, Jellyfin, AudiobookShelf) go through `SingleFileDownloadService`, which
+  hands **every request to the session at once** (no in-memory queue: a task started while the app is in the
+  background is discretionary, and a queue dies with the process). The session itself belongs to the
+  process-wide `BackgroundDownloadSession.shared` (`BookPlayer/Services/`, identifier `SingleFileDownloadService`,
+  kept for compatibility with tasks from older builds). It is created in `didFinishLaunching` and by
+  `application(_:handleEventsForBackgroundURLSession:completionHandler:)`, **never lazily from UI**: iOS only
+  delivers finished downloads to a live session with that identifier, and deletes each file once the delegate
+  callback returns, so files are moved into place there, not by the library screen. A process may create only one
+  session per identifier, so don't construct another. Per-task state (URL, `folderName`, `allOrNothing`) lives in
+  the task's `taskDescription` (`DownloadTaskInfo`), which survives relaunch; top-level files keep the legacy
+  `SingleFileDownload-<url>` format so dedupe still matches. Folder downloads are **staged in
+  `Application Support/PendingDownloads/` and moved into Documents in one step when the folder's last task ends**
+  (`DownloadFileStore`), because Documents is watched by the importer. An `allOrNothing` folder (one AudiobookShelf
+  book) is discarded if any file fails, and its other tasks are cancelled. A failed task with resume data is
+  resumed up to 3 times before its error is reported.
+- **AudiobookShelf downloads are per file** (`/api/items/:id/file/:ino/download`, see `AudiobookShelfDownloadPlan`),
+  not the whole-item `/api/items/:id/download`. For a folder item that route streams a zip built on the fly (chunked,
+  no `Content-Length`, no `Range`), so a dropped connection can't resume and big books failed once the app left the
+  foreground. The zip is only the fallback when the file list can't be read (podcasts, or the details fetch failed).
 - **Download verification:** `verifyDownloadedFile` rejects truncated files by comparing `AVURLAsset` duration to
   the stored duration (tolerance `max(2, expected*0.02)`); completion is broadcast only after verification.
   Don't skip it — it prevents promoting a truncated book.
@@ -487,3 +506,22 @@ The crash surfaces and invariants most likely to be broken by a change. (The ful
 12. **`BookPlayerKit` boundary:** `Shared/` importing app-layer types.
 13. **Integration session-expiry / token contracts** (see the integrations section).
 14. Hand-editing `Generated/AutoMockable.generated.swift`; adding code to a top-level **empty stub** folder.
+
+---
+
+## Next steps
+
+Fork-only section (NathanielOstrer/BookPlayer). Drop it from any PR to upstream.
+
+- Test the AudiobookShelf download fix on a device. Start a large multi-hour book, lock the phone or switch apps
+  for the whole download, and check the book imports complete. Then repeat with the app run from Xcode, and stop
+  it from Xcode partway through. That mimics the system killing the app. Do not force-quit it from the app
+  switcher for this test: iOS cancels every background transfer of an app the user force-quits.
+  Background-session behavior can't be exercised in the simulator or in unit tests
+  (`BackgroundDownloadSessionTests` uses an ephemeral session).
+- If the device test passes, open an upstream issue (none existed as of 2026-10-06) and a PR to `develop`.
+- The library screen's import prompt can still open while a download is in progress: `LibraryRootView` shows the
+  import on every `scenePhase == .active`, without checking `singleFileDownloadService.isDownloading`. Staging
+  keeps half-downloaded folders out of Documents, so only finished files can be picked up early.
+- `SyncService`'s background session (`BPDownloadURLSession`) has the same gap the single-file session had: it isn't
+  reconnected from `handleEventsForBackgroundURLSession`. Out of scope for the AudiobookShelf fix.
